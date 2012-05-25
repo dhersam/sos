@@ -1008,6 +1008,22 @@ hash_path_suffix = testing
         self.assertEquals(resp.status_int, 200)
         self.assertEquals(resp.body, 'Test obj body.')
 
+    def test_cdn_get_disabled(self):
+        prev_data = json.dumps({'account': 'acc', 'container': 'cont',
+                'ttl': 1234, 'logs_enabled': 'true', 'cdn_enabled': False})
+        self.test_origin.app = FakeApp(iter([
+            ('204 No Content', {}, prev_data), # call to _get_cdn_data
+            ('404 Not Found', {}, '',
+                lambda req: False if req.headers['if-modified-since'] ==
+                '2000-01-01' else 'Headers not kept')])) #call to get obj
+        req = Request.blank('http://origin_cdn.com:8080/h1234/obj1.jpg',
+            headers={'if-modified-since': '2000-01-01'},
+            environ={'REQUEST_METHOD': 'GET',
+                     'swift.cdn_hash': 'abcd',
+                     'swift.cdn_object_name': 'obj1.jpg'})
+        resp = req.get_response(self.test_origin)
+        self.assertEquals(resp.status_int, 404)
+
     def test_cdn_get_fail(self):
         prev_data = json.dumps({'account': 'acc', 'container': 'cont',
                 'ttl': 1234, 'logs_enabled': True, 'cdn_enabled': True})

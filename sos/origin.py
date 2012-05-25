@@ -271,6 +271,17 @@ class OriginBase(object):
                     token[:self.token_length], parsed.hostname)
         return cdn_urls
 
+    def log_info(self, msg, container='-', hsh='-', account='-', env={},
+            alt_env={}):
+        txid = env.get('swift.trans_id', None)
+        if not txid: 
+            txid = alt_env.get('swift.trans_id', '-')
+        stime = env.get('sos.start_time', None)
+        if not stime:
+            stime = alt_env.get('sos.start_time', time())
+        elapsed = time() - stime
+        self.logger.info("%s %s %s %s %s %.4f" %
+            (msg, container, hsh, account, txid, elapsed))
 
 class AdminHandler(OriginBase):
 
@@ -428,8 +439,11 @@ class CdnHandler(OriginBase):
                         cdn_resp.headers[header] = header_val
 
                 cdn_resp.headers.update(self._getCacheHeaders(hash_data.ttl))
-
+                self.log_info("Public CDN request %s %s" % (swift_path,
+                    resp.content_length), '-', hsh, hash_data.account,
+                    resp.environ, req.environ)
                 return cdn_resp
+            self.logger.warning('Public CDN request ignored, container is not CDN enabled %s' % hsh)
             if resp.status_int != 404:
                 self.logger.exception('Unexpected response from '
                     'Swift: %s, %s' % (resp.status, cdn_obj_path))
@@ -510,6 +524,7 @@ class OriginDbHandler(OriginBase):
             vsn, account, junk = split_path(req.path, 2, 3,
                                                  rest_with_last=True)
         except ValueError:
+            self.logger.debug("Invalid request: %s" % req.path)
             return HTTPBadRequest('Invalid request. '
                                   'URL format: /<api version>/<account>')
         if not account:
@@ -527,6 +542,7 @@ class OriginDbHandler(OriginBase):
             try:
                 limit = int(limit)
             except ValueError:
+                self.logger.debug("Invalid limit: %s" % get_param(req, 'limit'))
                 return HTTPBadRequest('Invalid limit, must be an integer')
 
         def get_listings(marker):
@@ -579,6 +595,8 @@ class OriginDbHandler(OriginBase):
             else:
                 resp_headers['Content-Type'] = 'text/plain; charset=UTF-8'
                 response_body = '\n'.join(listing_formatted) + '\n'
+            self.log_info("CDN container listing %d" % len(response_body),
+                account=account, env=env)
             return Response(body=response_body, headers=resp_headers)
         except OriginDbNotFound:
             return HTTPNotFound(request=req)
@@ -586,10 +604,12 @@ class OriginDbHandler(OriginBase):
     def origin_db_delete(self, env, req):
         """ Handles DELETEs in the Origin database """
         if not self.delete_enabled:
+            self.logger.debug("DELETE called but not enabled")
             return HTTPMethodNotAllowed(request=req)
         try:
             vsn, account, container = split_path(req.path, 3, 3)
         except ValueError:
+            self.logger.debug("Invalid DELETE request")
             return HTTPBadRequest('Invalid request. '
                 'URI format: /<api version>/<account>/<container>')
         hsh = self.hash_path(account, container)
@@ -621,6 +641,7 @@ class OriginDbHandler(OriginBase):
         # Return 404 if container didn't exist
         if resp.status_int == 404 and list_resp.status_int == 404:
             return HTTPNotFound(request=req)
+        self.log_info("CDN delete", container, hsh, account, resp.environ)
         return HTTPNoContent(request=req)
 
     def origin_db_head(self, env, req):
@@ -637,9 +658,9 @@ class OriginDbHandler(OriginBase):
         if hash_data:
             headers = self.get_cdn_urls(hsh, 'HEAD')
             headers.update({'X-TTL': hash_data.ttl,
-                'X-Log-Retention':
-                    hash_data.logs_enabled and 'True' or 'False',
+                'X-Log-Retention': hash_data.logs_enabled and 'True' or 'False',
                 'X-CDN-Enabled': hash_data.cdn_enabled and 'True' or 'False'})
+            self.log_info("CDN HEAD", container, hsh, account, req.environ)
             return HTTPNoContent(headers=headers)
         return HTTPNotFound(request=req)
 
@@ -669,17 +690,28 @@ class OriginDbHandler(OriginBase):
         if ttl < self.min_ttl or ttl > self.max_ttl:
             return HTTPBadRequest(_('Invalid X-TTL, must be between %(min)s '
                 'and %(max)s') % {'min': self.min_ttl, 'max': self.max_ttl})
+        # Log metadata if it's included in the header
+        log_msg = []        
         if 'X-Log-Retention' in req.headers:
             logs_enabled = req.headers.get('X-Log-Retention').lower() in \
                 TRUE_VALUES
+            log_msg.append('X-Log-Retention: %s' % logs_enabled)
         if 'X-CDN-Enabled' in req.headers:
             cdn_enabled = req.headers.get('X-CDN-Enabled').lower() in \
                 TRUE_VALUES
+            log_msg.append('X-CDN-Enabled: %s' % cdn_enabled)
+        if 'X-TTL' in req.headers:
+            log_msg.append('X-TTL: %d' % ttl)            
+        if len(log_msg) > 0:
+            self.log_info("Set CDN metadata %s" % log_msg, container, hsh,
+                account, env, req.environ)
         new_hash_data = HashData(account, container, ttl, cdn_enabled,
                                  logs_enabled)
         cdn_obj_data = new_hash_data.get_json_str()
         cdn_obj_etag = md5(cdn_obj_data).hexdigest()
         # this is always a PUT because a POST needs to update the file
+        if cdn_enabled:
+            self.log_info('CDN enable', container, hsh, account, req.environ)
         cdn_obj_resp = make_pre_authed_request(env, 'PUT', cdn_obj_path,
             body=cdn_obj_data, headers={'Etag': cdn_obj_etag},
             agent='SwiftOrigin').get_response(self.app)
